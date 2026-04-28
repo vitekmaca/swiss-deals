@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Swiss supermarket weekly deals scraper: Migros, COOP, Denner → site/index.html"""
-import sys, re, json, os
+"""Swiss supermarket weekly deals scraper: Migros, Denner → site/index.html"""
+import sys, re, os
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
@@ -20,8 +20,8 @@ os.makedirs("site", exist_ok=True)
 
 
 # ─── Migros ──────────────────────────────────────────────────────────────────
-# Strategy: Playwright intercepts the internal JSON API call the page makes
-# when loading promotions — no need to guess CSS selectors.
+# Playwright intercepts the internal JSON API call the page makes when loading
+# promotions — no CSS selectors needed.
 
 def scrape_migros():
     products = []
@@ -37,7 +37,7 @@ def scrape_migros():
                 if "json" in ct:
                     try:
                         captured.append({"url": url, "data": response.json()})
-                        print(f"[Migros] Captured: {url}", file=sys.stderr)
+                        print(f"[Migros] Captured JSON: {url}", file=sys.stderr)
                     except Exception:
                         pass
 
@@ -54,19 +54,16 @@ def scrape_migros():
                 wait_until="networkidle",
                 timeout=90_000,
             )
-            # Scroll to trigger lazy loads
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(3000)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(2000)
 
-            # Save debug HTML
             with open("site/debug_migros.html", "w", encoding="utf-8") as f:
                 f.write(page.content())
 
             browser.close()
 
-        # Parse captured API responses
         for entry in captured:
             data = entry["data"]
             items = (
@@ -109,106 +106,12 @@ def scrape_migros():
                         })
 
         if not captured:
-            print("[Migros] No JSON API calls captured — see site/debug_migros.html", file=sys.stderr)
+            print("[Migros] No JSON captured — check site/debug_migros.html", file=sys.stderr)
 
     except Exception as e:
         print(f"[Migros] ERROR: {e}", file=sys.stderr)
 
     print(f"[Migros] {len(products)} products", file=sys.stderr)
-    return products
-
-
-# ─── COOP ────────────────────────────────────────────────────────────────────
-# Same network intercept strategy for COOP.
-
-def scrape_coop():
-    products = []
-    captured = []
-
-    try:
-        from playwright.sync_api import sync_playwright
-
-        def on_response(response):
-            url = response.url
-            if "coop" in url and ("product" in url or "offer" in url or "promo" in url or "aktion" in url):
-                ct = response.headers.get("content-type", "")
-                if "json" in ct:
-                    try:
-                        captured.append({"url": url, "data": response.json()})
-                        print(f"[COOP] Captured: {url}", file=sys.stderr)
-                    except Exception:
-                        pass
-
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page(
-                user_agent=UA,
-                locale="de-CH",
-                extra_http_headers={"Accept-Language": "de-CH,de;q=0.9"},
-            )
-            page.on("response", on_response)
-            page.goto(
-                "https://www.coop.ch/de/einkaufen/supermarkt/aktionen.html",
-                wait_until="networkidle",
-                timeout=90_000,
-            )
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(3000)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2000)
-
-            # Save debug HTML
-            with open("site/debug_coop.html", "w", encoding="utf-8") as f:
-                f.write(page.content())
-
-            browser.close()
-
-        # Parse captured API responses
-        for entry in captured:
-            data = entry["data"]
-            items = (
-                data.get("products")
-                or data.get("items")
-                or data.get("results")
-                or data.get("articles")
-                or data.get("offers")
-                or []
-            )
-            if isinstance(items, list):
-                for item in items:
-                    name = (
-                        item.get("name", "")
-                        or item.get("title", "")
-                        or _nested(item, "product", "name")
-                        or ""
-                    )
-                    price = (
-                        _nested(item, "price", "value")
-                        or _nested(item, "price", "amount")
-                        or item.get("price", "")
-                        or ""
-                    )
-                    old_price = (
-                        _nested(item, "price", "original")
-                        or item.get("originalPrice", "")
-                        or ""
-                    )
-                    discount = item.get("discount", "") or item.get("saving", "") or ""
-                    if name:
-                        products.append({
-                            "name": str(name),
-                            "price": _fmt_price(price),
-                            "old_price": _fmt_price(old_price),
-                            "discount": str(discount),
-                        })
-
-        if not captured:
-            print("[COOP] No JSON API calls captured — see site/debug_coop.html", file=sys.stderr)
-
-    except Exception as e:
-        print(f"[COOP] ERROR: {e}", file=sys.stderr)
-
-    print(f"[COOP] {len(products)} products", file=sys.stderr)
     return products
 
 
@@ -287,13 +190,6 @@ def _fmt_price(val):
         return f"CHF {val:.2f}"
     return str(val)
 
-def _pw_text(tile, selector):
-    try:
-        el = tile.locator(selector)
-        return el.first.inner_text().strip() if el.count() > 0 else ""
-    except Exception:
-        return ""
-
 def _bs4_text(parent, selector):
     if parent is None:
         return ""
@@ -304,15 +200,14 @@ def _bs4_text(parent, selector):
 # ─── HTML page ───────────────────────────────────────────────────────────────
 
 STORE_META = {
-    "Migros": {"color": "#e87722", "url": "https://www.migros.ch/de/aktionen",                              "emoji": "🟠"},
-    "COOP":   {"color": "#c41230", "url": "https://www.coop.ch/de/einkaufen/supermarkt/aktionen.html",     "emoji": "🟡"},
-    "Denner": {"color": "#8b0000", "url": "https://www.denner.ch/de/aktionen",                              "emoji": "🔴"},
+    "Migros": {"color": "#e87722", "url": "https://www.migros.ch/de/aktionen",  "emoji": "🟠"},
+    "Denner": {"color": "#8b0000", "url": "https://www.denner.ch/de/aktionen",  "emoji": "🔴"},
 }
 
-def build_html(migros, coop, denner):
+def build_html(migros, denner):
     now = datetime.now()
     date_str = now.strftime("%d.%m.%Y %H:%M")
-    stores = [("Migros", migros), ("COOP", coop), ("Denner", denner)]
+    stores = [("Migros", migros), ("Denner", denner)]
     total = sum(len(p) for _, p in stores)
 
     sections_html = ""
@@ -321,13 +216,10 @@ def build_html(migros, coop, denner):
         color, url, emoji = meta["color"], meta["url"], meta["emoji"]
         count = len(products)
 
-        cards_html = ""
         if count == 0:
-            cards_html = (
-                '<p class="empty">⚠️ Data se nepodařilo načíst. '
-                f'<a href="debug_{store_name.lower()}.html">Debug HTML</a></p>'
-            )
+            cards_html = '<p class="empty">⚠️ Data se nepodařilo načíst — zkus to znovu příští čtvrtek.</p>'
         else:
+            cards_html = ""
             for p in products:
                 disc_html = f'<span class="badge">{p["discount"]}</span>' if p.get("discount") else ""
                 old_html = f'<span class="old">{p["old_price"]}</span>' if p.get("old_price") else ""
@@ -378,7 +270,6 @@ def build_html(migros, coop, denner):
     .tab.active {{ color: white; }}
     .tab[data-store="all"].active    {{ background: #1c1c1e; }}
     .tab[data-store="Migros"].active {{ background: #e87722; }}
-    .tab[data-store="COOP"].active   {{ background: #c41230; }}
     .tab[data-store="Denner"].active {{ background: #8b0000; }}
     main {{ padding: 16px; max-width: 1200px; margin: 0 auto; }}
     .store {{ margin-bottom: 24px; border-radius: 14px; overflow: hidden;
@@ -408,12 +299,11 @@ def build_html(migros, coop, denner):
 <body>
 <header>
   <h1>🛒 Švýcarské akce</h1>
-  <p>Migros · COOP · Denner &nbsp;·&nbsp; {total} produktů &nbsp;·&nbsp; aktualizováno {date_str}</p>
+  <p>Migros · Denner &nbsp;·&nbsp; {total} produktů &nbsp;·&nbsp; aktualizováno {date_str}</p>
 </header>
 <div class="tabs">
   <button class="tab active" data-store="all">Vše ({total})</button>
   <button class="tab" data-store="Migros">Migros ({len(migros)})</button>
-  <button class="tab" data-store="COOP">COOP ({len(coop)})</button>
   <button class="tab" data-store="Denner">Denner ({len(denner)})</button>
 </div>
 <main>{sections_html}</main>
@@ -443,13 +333,10 @@ if __name__ == "__main__":
     print("=== Migros ===", file=sys.stderr)
     migros = scrape_migros()
 
-    print("=== COOP ===", file=sys.stderr)
-    coop = scrape_coop()
-
     print("=== Denner ===", file=sys.stderr)
     denner = scrape_denner()
 
-    html = build_html(migros, coop, denner)
+    html = build_html(migros, denner)
     with open("site/index.html", "w", encoding="utf-8") as f:
         f.write(html)
     print("✓ site/index.html vygenerován")
