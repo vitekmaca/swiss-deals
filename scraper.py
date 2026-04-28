@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Swiss supermarket weekly deals scraper: Migros, COOP, Denner → index.html"""
-import sys, re
+"""Swiss supermarket weekly deals scraper: Migros, COOP, Denner → site/index.html"""
+import sys, re, json, os
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
@@ -16,57 +16,101 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
 }
 
+os.makedirs("site", exist_ok=True)
+
 
 # ─── Migros ──────────────────────────────────────────────────────────────────
+# Strategy: Playwright intercepts the internal JSON API call the page makes
+# when loading promotions — no need to guess CSS selectors.
 
 def scrape_migros():
     products = []
+    captured = []
+
     try:
-        s = requests.Session()
-        s.headers.update(HEADERS)
+        from playwright.sync_api import sync_playwright
 
-        token_r = s.post(
-            "https://www.migros.ch/oauthclients/public/tokens/guest",
-            json={"marketCode": "national"},
-            timeout=20,
-        )
-        token_r.raise_for_status()
-        token = token_r.json().get("access_token", "")
+        def on_response(response):
+            url = response.url
+            if ("promotion" in url or "aktionen" in url) and "migros" in url:
+                ct = response.headers.get("content-type", "")
+                if "json" in ct:
+                    try:
+                        captured.append({"url": url, "data": response.json()})
+                        print(f"[Migros] Captured: {url}", file=sys.stderr)
+                    except Exception:
+                        pass
 
-        promo_r = s.get(
-            "https://www.migros.ch/product-display/public/web/v2/products/promotion/search",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"lang": "de", "marketCode": "national", "limit": 200, "offset": 0},
-            timeout=30,
-        )
-        promo_r.raise_for_status()
-        data = promo_r.json()
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent=UA,
+                locale="de-CH",
+                extra_http_headers={"Accept-Language": "de-CH,de;q=0.9"},
+            )
+            page.on("response", on_response)
+            page.goto(
+                "https://www.migros.ch/de/aktionen",
+                wait_until="networkidle",
+                timeout=90_000,
+            )
+            # Scroll to trigger lazy loads
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(3000)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)
 
-        items = data.get("products") or data.get("items") or data.get("results") or []
-        for item in items:
-            name = _nested(item, "name", "de") or item.get("name", "")
-            price = (
-                _nested(item, "price", "effective", "value")
-                or _nested(item, "price", "value")
-                or ""
+            # Save debug HTML
+            with open("site/debug_migros.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+
+            browser.close()
+
+        # Parse captured API responses
+        for entry in captured:
+            data = entry["data"]
+            items = (
+                data.get("products")
+                or data.get("items")
+                or data.get("results")
+                or data.get("articles")
+                or []
             )
-            old_price = (
-                _nested(item, "price", "recommendedRetailPrice")
-                or _nested(item, "price", "original", "value")
-                or ""
-            )
-            discount = (
-                _nested(item, "promotion", "reductionLabel")
-                or _nested(item, "promotion", "labelTextKey")
-                or ""
-            )
-            if name:
-                products.append({
-                    "name": str(name),
-                    "price": _fmt_price(price),
-                    "old_price": _fmt_price(old_price),
-                    "discount": str(discount),
-                })
+            if isinstance(items, list):
+                for item in items:
+                    name = (
+                        _nested(item, "name", "de")
+                        or _nested(item, "name", "text")
+                        or item.get("name", "")
+                        or item.get("title", "")
+                    )
+                    price = (
+                        _nested(item, "price", "effective", "value")
+                        or _nested(item, "price", "value")
+                        or _nested(item, "price", "amount")
+                        or ""
+                    )
+                    old_price = (
+                        _nested(item, "price", "recommendedRetailPrice")
+                        or _nested(item, "price", "original", "value")
+                        or ""
+                    )
+                    discount = (
+                        _nested(item, "promotion", "reductionLabel")
+                        or _nested(item, "badges", 0, "text")
+                        or ""
+                    )
+                    if name:
+                        products.append({
+                            "name": str(name),
+                            "price": _fmt_price(price),
+                            "old_price": _fmt_price(old_price),
+                            "discount": str(discount),
+                        })
+
+        if not captured:
+            print("[Migros] No JSON API calls captured — see site/debug_migros.html", file=sys.stderr)
+
     except Exception as e:
         print(f"[Migros] ERROR: {e}", file=sys.stderr)
 
@@ -75,11 +119,26 @@ def scrape_migros():
 
 
 # ─── COOP ────────────────────────────────────────────────────────────────────
+# Same network intercept strategy for COOP.
 
 def scrape_coop():
     products = []
+    captured = []
+
     try:
         from playwright.sync_api import sync_playwright
+
+        def on_response(response):
+            url = response.url
+            if "coop" in url and ("product" in url or "offer" in url or "promo" in url or "aktion" in url):
+                ct = response.headers.get("content-type", "")
+                if "json" in ct:
+                    try:
+                        captured.append({"url": url, "data": response.json()})
+                        print(f"[COOP] Captured: {url}", file=sys.stderr)
+                    except Exception:
+                        pass
+
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             page = browser.new_page(
@@ -87,51 +146,65 @@ def scrape_coop():
                 locale="de-CH",
                 extra_http_headers={"Accept-Language": "de-CH,de;q=0.9"},
             )
+            page.on("response", on_response)
             page.goto(
                 "https://www.coop.ch/de/einkaufen/supermarkt/aktionen.html",
-                wait_until="domcontentloaded",
-                timeout=60_000,
+                wait_until="networkidle",
+                timeout=90_000,
             )
-            for _ in range(15):
-                try:
-                    btn = page.locator(
-                        "button:has-text('Alle laden'), "
-                        "button:has-text('Mehr laden'), "
-                        "button:has-text('Alle Aktionen')"
-                    )
-                    if btn.count() == 0:
-                        break
-                    btn.first.scroll_into_view_if_needed()
-                    btn.first.click(timeout=4000)
-                    page.wait_for_timeout(2500)
-                except Exception:
-                    break
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(3000)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(2000)
 
-            tiles = page.locator(
-                "[class*='product-tile']:not([class*='wrapper']), "
-                "[class*='ProductTile']:not([class*='Wrapper']), "
-                "li[class*='product-list']"
-            )
-            for i in range(tiles.count()):
-                tile = tiles.nth(i)
-                name = _pw_text(tile,
-                    "[class*='product-name'], [class*='ProductName'], "
-                    "[class*='product-title'], h3, h2")
-                price = _pw_text(tile,
-                    "[class*='price--reduced'], [class*='ActionPrice'], "
-                    "[class*='sale-price'], [class*='actual-price'], "
-                    "[class*='price-action']")
-                old_price = _pw_text(tile,
-                    "[class*='price--original'], [class*='OldPrice'], "
-                    "[class*='regular-price'], s, del, [class*='CrossedPrice']")
-                discount = _pw_text(tile,
-                    "[class*='badge'], [class*='discount'], [class*='saving']")
-                if name:
-                    products.append({
-                        "name": name, "price": price,
-                        "old_price": old_price, "discount": discount,
-                    })
+            # Save debug HTML
+            with open("site/debug_coop.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+
             browser.close()
+
+        # Parse captured API responses
+        for entry in captured:
+            data = entry["data"]
+            items = (
+                data.get("products")
+                or data.get("items")
+                or data.get("results")
+                or data.get("articles")
+                or data.get("offers")
+                or []
+            )
+            if isinstance(items, list):
+                for item in items:
+                    name = (
+                        item.get("name", "")
+                        or item.get("title", "")
+                        or _nested(item, "product", "name")
+                        or ""
+                    )
+                    price = (
+                        _nested(item, "price", "value")
+                        or _nested(item, "price", "amount")
+                        or item.get("price", "")
+                        or ""
+                    )
+                    old_price = (
+                        _nested(item, "price", "original")
+                        or item.get("originalPrice", "")
+                        or ""
+                    )
+                    discount = item.get("discount", "") or item.get("saving", "") or ""
+                    if name:
+                        products.append({
+                            "name": str(name),
+                            "price": _fmt_price(price),
+                            "old_price": _fmt_price(old_price),
+                            "discount": str(discount),
+                        })
+
+        if not captured:
+            print("[COOP] No JSON API calls captured — see site/debug_coop.html", file=sys.stderr)
+
     except Exception as e:
         print(f"[COOP] ERROR: {e}", file=sys.stderr)
 
@@ -196,9 +269,15 @@ def scrape_denner():
 
 def _nested(d, *keys):
     for k in keys:
-        if not isinstance(d, dict):
+        if isinstance(d, list):
+            try:
+                d = d[k]
+            except (IndexError, TypeError):
+                return None
+        elif isinstance(d, dict):
+            d = d.get(k)
+        else:
             return None
-        d = d.get(k)
     return d
 
 def _fmt_price(val):
@@ -225,9 +304,9 @@ def _bs4_text(parent, selector):
 # ─── HTML page ───────────────────────────────────────────────────────────────
 
 STORE_META = {
-    "Migros":  {"color": "#e87722", "url": "https://www.migros.ch/de/aktionen", "emoji": "🟠"},
-    "COOP":    {"color": "#c41230", "url": "https://www.coop.ch/de/einkaufen/supermarkt/aktionen.html", "emoji": "🟡"},
-    "Denner":  {"color": "#8b0000", "url": "https://www.denner.ch/de/aktionen", "emoji": "🔴"},
+    "Migros": {"color": "#e87722", "url": "https://www.migros.ch/de/aktionen",                              "emoji": "🟠"},
+    "COOP":   {"color": "#c41230", "url": "https://www.coop.ch/de/einkaufen/supermarkt/aktionen.html",     "emoji": "🟡"},
+    "Denner": {"color": "#8b0000", "url": "https://www.denner.ch/de/aktionen",                              "emoji": "🔴"},
 }
 
 def build_html(migros, coop, denner):
@@ -239,14 +318,15 @@ def build_html(migros, coop, denner):
     sections_html = ""
     for store_name, products in stores:
         meta = STORE_META[store_name]
-        color = meta["color"]
-        url = meta["url"]
-        emoji = meta["emoji"]
+        color, url, emoji = meta["color"], meta["url"], meta["emoji"]
         count = len(products)
 
         cards_html = ""
         if count == 0:
-            cards_html = '<p class="empty">⚠️ Data se nepodařilo načíst. Zkontroluj <a href="https://github.com" target="_blank">Actions logy</a>.</p>'
+            cards_html = (
+                '<p class="empty">⚠️ Data se nepodařilo načíst. '
+                f'<a href="debug_{store_name.lower()}.html">Debug HTML</a></p>'
+            )
         else:
             for p in products:
                 disc_html = f'<span class="badge">{p["discount"]}</span>' if p.get("discount") else ""
@@ -262,7 +342,7 @@ def build_html(migros, coop, denner):
           </div>"""
 
         sections_html += f"""
-      <section class="store">
+      <section class="store" data-store="{store_name}">
         <div class="store-header" style="background:{color}">
           <div>
             <span class="store-emoji">{emoji}</span>
@@ -284,159 +364,75 @@ def build_html(migros, coop, denner):
   <title>Švýcarské akce</title>
   <style>
     *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #f2f2f7;
-      color: #1c1c1e;
-      min-height: 100vh;
-    }}
-
-    header {{
-      background: #1c1c1e;
-      color: white;
-      padding: 24px 20px 20px;
-      position: sticky;
-      top: 0;
-      z-index: 10;
-      box-shadow: 0 2px 12px rgba(0,0,0,.3);
-    }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #f2f2f7; color: #1c1c1e; min-height: 100vh; }}
+    header {{ background: #1c1c1e; color: white; padding: 24px 20px 20px;
+              position: sticky; top: 0; z-index: 10; box-shadow: 0 2px 12px rgba(0,0,0,.3); }}
     header h1 {{ font-size: 22px; font-weight: 700; }}
     header p  {{ font-size: 13px; color: #8e8e93; margin-top: 4px; }}
-
-    .tabs {{
-      display: flex;
-      gap: 8px;
-      padding: 14px 16px;
-      background: #f2f2f7;
-      border-bottom: 1px solid #d1d1d6;
-      overflow-x: auto;
-    }}
-    .tab {{
-      padding: 7px 18px;
-      border-radius: 20px;
-      border: none;
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      white-space: nowrap;
-      background: #e5e5ea;
-      color: #1c1c1e;
-      transition: all .15s;
-    }}
+    .tabs {{ display: flex; gap: 8px; padding: 14px 16px; background: #f2f2f7;
+             border-bottom: 1px solid #d1d1d6; overflow-x: auto; }}
+    .tab {{ padding: 7px 18px; border-radius: 20px; border: none; font-size: 14px;
+            font-weight: 600; cursor: pointer; white-space: nowrap;
+            background: #e5e5ea; color: #1c1c1e; transition: all .15s; }}
     .tab.active {{ color: white; }}
     .tab[data-store="all"].active    {{ background: #1c1c1e; }}
     .tab[data-store="Migros"].active {{ background: #e87722; }}
     .tab[data-store="COOP"].active   {{ background: #c41230; }}
     .tab[data-store="Denner"].active {{ background: #8b0000; }}
-
     main {{ padding: 16px; max-width: 1200px; margin: 0 auto; }}
-
-    .store {{ margin-bottom: 24px; border-radius: 14px; overflow: hidden; box-shadow: 0 1px 6px rgba(0,0,0,.1); }}
-
-    .store-header {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 14px 18px;
-      color: white;
-      flex-wrap: wrap;
-      gap: 8px;
-    }}
-    .store-emoji  {{ font-size: 22px; margin-right: 8px; }}
-    .store-name   {{ font-size: 20px; font-weight: 700; }}
-    .store-meta   {{ display: flex; align-items: center; gap: 12px; }}
-    .store-count  {{ font-size: 13px; opacity: .85; }}
-    .store-link   {{
-      font-size: 13px; font-weight: 600; color: white;
-      text-decoration: none; opacity: .9;
-    }}
+    .store {{ margin-bottom: 24px; border-radius: 14px; overflow: hidden;
+              box-shadow: 0 1px 6px rgba(0,0,0,.1); }}
+    .store-header {{ display: flex; align-items: center; justify-content: space-between;
+                     padding: 14px 18px; color: white; flex-wrap: wrap; gap: 8px; }}
+    .store-emoji {{ font-size: 22px; margin-right: 8px; }}
+    .store-name  {{ font-size: 20px; font-weight: 700; }}
+    .store-meta  {{ display: flex; align-items: center; gap: 12px; }}
+    .store-count {{ font-size: 13px; opacity: .85; }}
+    .store-link  {{ font-size: 13px; font-weight: 600; color: white; text-decoration: none; opacity: .9; }}
     .store-link:hover {{ opacity: 1; text-decoration: underline; }}
-
-    .cards {{
-      background: white;
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-      gap: 1px;
-      background: #e5e5ea;
-    }}
-
-    .card {{
-      background: white;
-      padding: 14px 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }}
-    .card-name  {{ font-size: 14px; line-height: 1.35; color: #1c1c1e; }}
+    .cards {{ background: #e5e5ea; display: grid;
+              grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1px; }}
+    .card {{ background: white; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }}
+    .card-name  {{ font-size: 14px; line-height: 1.35; }}
     .card-price {{ display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }}
-
     .price {{ font-size: 18px; font-weight: 700; color: #c00; }}
     .old   {{ font-size: 12px; color: #8e8e93; text-decoration: line-through; }}
-    .badge {{
-      font-size: 11px; font-weight: 700; padding: 2px 8px;
-      border-radius: 10px; background: #c00; color: white;
-    }}
-
+    .badge {{ font-size: 11px; font-weight: 700; padding: 2px 8px;
+              border-radius: 10px; background: #c00; color: white; }}
     .empty {{ padding: 24px; color: #8e8e93; font-style: italic; background: white; }}
-
-    footer {{
-      text-align: center;
-      padding: 24px;
-      font-size: 12px;
-      color: #8e8e93;
-    }}
-
     .hidden {{ display: none !important; }}
-
-    @media (max-width: 480px) {{
-      .cards {{ grid-template-columns: 1fr 1fr; }}
-    }}
+    @media (max-width: 480px) {{ .cards {{ grid-template-columns: 1fr 1fr; }} }}
   </style>
 </head>
 <body>
-
 <header>
   <h1>🛒 Švýcarské akce</h1>
   <p>Migros · COOP · Denner &nbsp;·&nbsp; {total} produktů &nbsp;·&nbsp; aktualizováno {date_str}</p>
 </header>
-
 <div class="tabs">
   <button class="tab active" data-store="all">Vše ({total})</button>
-  <button class="tab" data-store="Migros" style="">Migros ({len(migros)})</button>
+  <button class="tab" data-store="Migros">Migros ({len(migros)})</button>
   <button class="tab" data-store="COOP">COOP ({len(coop)})</button>
   <button class="tab" data-store="Denner">Denner ({len(denner)})</button>
 </div>
-
-<main>
-  {sections_html}
-</main>
-
-<footer>
+<main>{sections_html}</main>
+<footer style="text-align:center;padding:24px;font-size:12px;color:#8e8e93;">
   Aktualizováno každý čtvrtek automaticky přes
-  <a href="https://github.com/features/actions" target="_blank">GitHub Actions</a>.
+  <a href="https://github.com/vitekmaca/swiss-deals/actions" target="_blank">GitHub Actions</a>.
 </footer>
-
 <script>
-  const tabs = document.querySelectorAll('.tab');
-  const sections = document.querySelectorAll('.store');
-
-  tabs.forEach(tab => {{
+  document.querySelectorAll('.tab').forEach(tab => {{
     tab.addEventListener('click', () => {{
-      tabs.forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
       const store = tab.dataset.store;
-      sections.forEach(s => {{
-        if (store === 'all' || s.querySelector('.store-name').textContent === store) {{
-          s.classList.remove('hidden');
-        }} else {{
-          s.classList.add('hidden');
-        }}
+      document.querySelectorAll('.store').forEach(s => {{
+        s.classList.toggle('hidden', store !== 'all' && s.dataset.store !== store);
       }});
     }});
   }});
 </script>
-
 </body>
 </html>"""
 
@@ -454,6 +450,6 @@ if __name__ == "__main__":
     denner = scrape_denner()
 
     html = build_html(migros, coop, denner)
-    with open("index.html", "w", encoding="utf-8") as f:
+    with open("site/index.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print("✓ index.html vygenerován")
+    print("✓ site/index.html vygenerován")
