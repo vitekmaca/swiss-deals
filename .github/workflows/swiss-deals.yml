@@ -1,0 +1,36 @@
+name: Swiss Supermarket Deals
+
+on:
+  schedule:
+    # Every Thursday at 09:00 CEST (07:00 UTC) — Swiss stores rotate deals on Thursdays
+    - cron: "0 7 * * 4"
+  workflow_dispatch:
+    # Manual trigger — useful for first test
+
+jobs:
+  scrape-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: playwright install chromium --with-deps
+
+      - name: Run scraper
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python scraper.py
